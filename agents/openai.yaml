@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Peer"
+  short_description: "Chat with Codex and inspect live task progress"
+  default_prompt: "使用 $codex-peer 查看目标 Codex 线程的工作进度，并与它交流。"
