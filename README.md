@@ -1,72 +1,93 @@
 # Codex Peer
 
-Codex Peer 是一个本地 Codex 技能和命令行工具，用于启动新的 Codex worker、向已有线程发送任务，以及查看进度和回复。命令以单行 JSON 输出，便于其他代理或脚本处理。
+让 Claude、Gemini、Antigravity 等外部 AI 代理通过本地命令启动 Codex 会话、给 Codex 分配任务并读取回复。你可以继续和原来的代理对话，由它负责与 Codex 协作。
 
-## 环境要求
+```text
+你 → Claude / Gemini 等代理 → codex-peer → Codex 会话
+                              ← 进度和回复 ←
+```
 
-- Python 3（脚本仅使用标准库）
-- 已安装并配置的 [Codex CLI](https://github.com/openai/codex)
-- 如需连接 VS Code 中的现有线程，需要可访问对应的本地 Codex 会话和扩展环境
+例如，你可以让 Claude 检查项目，同时请 Codex 独立审查代码，再由 Claude 汇总结果。Codex Peer 也支持连接本机已有的 Codex VS Code 线程。
+
+## 开始之前
+
+- 外部代理需要能够运行本地 shell 命令，并与 Codex 处于同一台机器或共享同一运行环境。
+- 安装并登录 [Codex CLI](https://github.com/openai/codex)，确认 `codex` 命令可以使用。
+- 安装 Python 3；Codex Peer 的脚本不需要额外的 Python 包。
+- 连接已有 VS Code 线程时，还需要能访问该环境中的 Codex 会话数据和扩展。
+
+**权限提示：**新建会话和通过 CLI 恢复会话时，本工具调用 Codex 的 `--dangerously-bypass-approvals-and-sandbox` 参数，Codex 将不受审批和沙箱限制。请只在你信任的环境中运行，并确认外部代理及其任务具有相应权限。
 
 ## 安装
 
-将仓库克隆到 Codex 技能目录：
+在外部代理能够访问的终端中运行：
 
 ```bash
 mkdir -p ~/.codex/skills
 git clone https://github.com/CinJack/codex-peer.git ~/.codex/skills/codex-peer
-```
-
-将命令所在目录加入 `PATH`：
-
-```bash
 export PATH="$HOME/.codex/skills/codex-peer/scripts:$PATH"
+codex-peer --help
 ```
 
-可将上述 `export` 命令加入 shell 配置文件，使其在新终端中生效。也可以直接运行 `python3 ~/.codex/skills/codex-peer/scripts/codex_monitor.py`，无需修改 `PATH`。
-
-## 快速开始
-
-启动一个新的 worker 并等待任务完成：
+如需在以后打开的终端中使用，将 `export PATH=...` 加入 shell 配置文件。如果外部代理没有继承这个 `PATH`，可以让它直接运行：
 
 ```bash
-codex-peer spawn --name worker1 '检查当前项目并总结发现' --cwd "$PWD" --wait 1800
+python3 ~/.codex/skills/codex-peer/scripts/codex_monitor.py --help
 ```
 
-向该 worker 发送后续任务：
+## 让外部代理联系 Codex
+
+打开 Claude、Gemini 或其他能执行本地命令的代理，在对话中发送类似下面的指令。把项目路径和任务换成你的实际需求：
+
+> 请阅读 `~/.codex/skills/codex-peer/SKILL.md`，使用其中的 codex-peer 工具启动一个新的 Codex 会话，让 Codex 审查 `/path/to/project` 中的代码。等待它完成后，结合你的发现给我一份汇总。
+
+外部代理会调用 `codex-peer` 启动 Codex、等待结果并读取回复。你也可以继续对外部代理说“请让 Codex 检查测试”或“问 Codex 为什么建议这样修改”，让它向同一个会话追问。
+
+如果你更希望自己在终端操作，也可以直接执行：
 
 ```bash
-codex-peer ask --thread worker1 '继续检查测试覆盖情况' --wait 1800
+codex-peer spawn --name reviewer '审查这个项目并总结发现' --cwd /path/to/project --wait 1800
+codex-peer ask --thread reviewer '请进一步检查测试覆盖情况' --wait 1800
 ```
 
-同时启动多个 worker，并查看状态：
+`reviewer` 是本地会话别名，可以自行修改。如果等待超时，会话可能仍在运行；继续等待即可，不要重新发送同一任务：
 
 ```bash
-codex-peer spawn --name review '检查代码质量' --cwd "$PWD"
-codex-peer spawn --name tests '运行项目测试' --cwd "$PWD"
-codex-peer fleet
-codex-peer wait --thread review --wait 1800
-codex-peer wait --thread tests --wait 1800
+codex-peer wait --thread reviewer --wait 60
 ```
 
-如果等待超时，任务可能仍在运行；使用 `codex-peer wait --thread worker1 --wait 60` 继续等待，无需重新发送任务。
+## 连接已有 Codex 会话
 
-## 常用命令
+如果你希望外部代理联系 VS Code 中已经打开的 Codex 线程，可以告诉它：
 
-| 命令 | 用途 |
+> 请阅读 `~/.codex/skills/codex-peer/SKILL.md`，找到标题包含“项目审查”的已有 Codex 线程，询问它目前的进度，并把回复告诉我。
+
+也可以在终端中查找和选择线程：
+
+```bash
+codex-peer threads --query '项目审查'
+codex-peer use <线程UUID>
+codex-peer ask '请总结当前进度' --wait 1800
+```
+
+默认建议为新任务启动新会话；需要接续现有上下文时再选择已有线程。线程数据必须能从运行工具的环境访问。
+
+## 常用操作
+
+| 目的 | 命令 |
 | --- | --- |
-| `spawn` | 启动新的 Codex worker |
-| `fleet` | 查看已命名 worker 的状态 |
-| `ask` / `send` | 向线程发送消息，分别支持等待或立即返回 |
-| `wait` | 等待线程完成或产生回复 |
-| `status` / `read` | 查看线程状态或增量读取事件 |
-| `threads` / `use` | 查找或选择已有线程 |
-| `history` / `event` | 查询历史记录或展开事件 |
-| `interrupt` / `doctor` | 中断线程或检查连接 |
+| 查看已命名的 worker | `codex-peer fleet` |
+| 查看某个会话的状态 | `codex-peer status --thread reviewer` |
+| 读取新消息和工具事件 | `codex-peer read --thread reviewer` |
+| 等待任务完成 | `codex-peer wait --thread reviewer --wait 60` |
+| 检查线程连接 | `codex-peer doctor --thread reviewer` |
+| 查看所有命令和选项 | `codex-peer --help` |
 
-运行 `codex-peer --help` 查看完整选项，或阅读 [SKILL.md](SKILL.md) 了解代理工作流程和输出字段。
+命令输出为单行 JSON，供外部代理解析。完整工作流程、多个 worker 的用法及返回状态说明见 [SKILL.md](SKILL.md)。
 
 ## 测试
+
+在仓库目录中运行：
 
 ```bash
 python3 -m unittest discover -s scripts -p 'test_*.py'
