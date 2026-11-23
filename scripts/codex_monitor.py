@@ -284,12 +284,13 @@ def codex_binary():
 class IPC:
     """Local extension follower protocol, matched to installed extension versions."""
     def __init__(self):
-        source = (extension() / 'out/extension.js').read_text()
+        ext = extension()
+        source = (ext / 'out/extension.js').read_text()
         self.versions = {}
         for name in ('thread-owner-discovery', 'thread-follower-start-turn', 'thread-follower-steer-turn', 'thread-follower-interrupt-turn', 'thread-follower-read-model-settings'):
             found = re.search(r'"' + re.escape(name) + r'":(\d+)', source)
             if not found:
-                raise PeerError(f'IPC version unavailable: {name}')
+                raise PeerError(f'legacy VS Code IPC removed in {ext.name} (missing {name}); live panel delivery unavailable')
             self.versions[name] = int(found[1])
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.settimeout(8)
@@ -359,9 +360,11 @@ def start_exec(command):
     proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     deadline = time.monotonic() + 20
     thread_id = None
+    eof = False
     while time.monotonic() < deadline:
         line = proc.stdout.readline()
         if not line:
+            eof = True
             break
         try:
             row = json.loads(line)
@@ -371,8 +374,13 @@ def start_exec(command):
             thread_id = row['thread_id']
             break
     if not thread_id:
+        if eof and proc.poll() is None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         err = (proc.stderr.read() if proc.poll() is not None else '').strip()
-        raise PeerError(f'failed to start codex exec: {err or "no thread.started event"}')
+        raise PeerError(f'failed to start codex exec: {short(err, 600) or "no thread.started event"}')
     for _ in range(40):
         try:
             return resolve(thread_id), proc.pid
@@ -401,6 +409,19 @@ def spawn(prompt, name=None, cwd=None, model=None):
         save_fleet(workers)
         receipt['name'] = name
     return info, receipt
+
+WRITER_CONFLICT = ('already has an active writer', 'thread-store conflict')
+OWNER_HINT = 'thread is held by another Codex process (e.g. the VS Code panel app-server); message was queued and is delivered when that owner drains its queue'
+
+def queue_message(info, content, receipt, path):
+    receipt.update(delivery='submitting', transport='codex-queue', operation='queue')
+    save(path, receipt)
+    try:
+        outcome = subprocess.run([codex_binary(), 'queue', '--thread', info['id'], '--message', content, '--resume'], capture_output=True, text=True, timeout=30)
+        receipt['delivery'] = 'queued' if outcome.returncode == 0 else 'rejected'
+        receipt['result'] = short((outcome.stdout + outcome.stderr).strip(), 500)
+    except (OSError, subprocess.TimeoutExpired, PeerError) as error:
+        receipt.update(delivery='unconfirmed', error=str(error))
 
 def send(info, message, mode='auto'):
     message_id = uuid.uuid4().hex[:12]
@@ -467,16 +488,17 @@ def send(info, message, mode='auto'):
             receipt.pop('live_unavailable', None)
             receipt.pop('hint', None)
         except (OSError, PeerError) as error:
-            receipt.update(delivery='rejected', error=str(error))
+            conflict = any(phrase in str(error).lower() for phrase in WRITER_CONFLICT)
+            if mode == 'auto' and conflict:
+                receipt['resume_error'] = short(str(error), 300)
+                receipt['hint'] = OWNER_HINT
+                queue_message(info, content, receipt, path)
+            else:
+                receipt.update(delivery='rejected', error=str(error))
+                if mode == 'exec' and conflict:
+                    receipt['hint'] = 'thread has an active writer (VS Code panel); retry with --mode queue or --mode auto'
     else:
-        receipt.update(delivery='submitting', transport='codex-queue', operation='queue')
-        save(path, receipt)
-        try:
-            outcome = subprocess.run([codex_binary(), 'queue', '--thread', info['id'], '--message', content], capture_output=True, text=True, timeout=15)
-            receipt['delivery'] = 'queued' if outcome.returncode == 0 else 'rejected'
-            receipt['result'] = short((outcome.stdout + outcome.stderr).strip(), 500)
-        except (OSError, subprocess.TimeoutExpired, PeerError) as error:
-            receipt.update(delivery='unconfirmed', error=str(error))
+        queue_message(info, content, receipt, path)
     save(path, receipt)
     save(STATE / f"last-{info['id']}.json", {'id': message_id})
     return receipt
@@ -510,7 +532,7 @@ def read_new(info, args):
 
 FAILED = {'rejected', 'not_sent'}
 SETTLE_SECONDS = 20
-LIVE_HINT = 'thread is not open in a Codex VS Code panel; open it there for live delivery, otherwise messages are queued'
+LIVE_HINT = 'live panel IPC unavailable; messages fall back to exec resume or codex queue'
 
 def wait_for(info, args, receipt=None):
     if args.after:
@@ -588,7 +610,11 @@ def wait_for(info, args, receipt=None):
         time.sleep(.5 if args.wait <= 60 else 1)
 
 def doctor(info):
-    result = {'thread': info['id'], 'log': str(info['log']), 'codex': codex_binary(), 'live': False}
+    result = {'thread': info['id'], 'log': str(info['log']), 'codex': codex_binary(), 'live': False, 'queue_supported': True}
+    try:
+        result['extension'] = extension().name
+    except PeerError:
+        pass
     try:
         with IPC() as client:
             owner = client.owner(info['id'])
@@ -598,6 +624,8 @@ def doctor(info):
         result['live_error'] = str(error)
         if 'no-client-found' in str(error):
             result['hint'] = LIVE_HINT
+        else:
+            result['hint'] = 'live panel IPC unavailable; send/ask auto mode uses exec resume or codex queue --resume fallback'
     return result
 
 def interrupt(info):
@@ -626,9 +654,9 @@ def fleet_status(clean=False):
 
 def compact(receipt):
     """Caller-facing receipt; the full record (marker, raw IPC result) stays on disk."""
-    keys = ('id', 'name', 'thread', 'delivery', 'operation', 'turn', 'pid', 'error', 'live_unavailable', 'hint')
+    keys = ('id', 'name', 'thread', 'delivery', 'transport', 'operation', 'turn', 'pid', 'error', 'resume_error', 'live_unavailable', 'hint')
     result = {k: receipt[k] for k in keys if receipt.get(k)}
-    if receipt.get('delivery') == 'rejected' and receipt.get('transport') == 'codex-queue':
+    if receipt.get('transport') == 'codex-queue' and (receipt.get('result') or receipt.get('delivery') == 'rejected'):
         result['result'] = receipt.get('result')
     return result
 

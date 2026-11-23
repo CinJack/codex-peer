@@ -238,6 +238,54 @@ class PeerTests(unittest.TestCase):
     def test_compact_receipt_hides_raw_fields(self):
         receipt = dict(id='x', delivery='accepted', operation='start', marker='m', after=1, result={'big': 1}, turn='t')
         self.assertEqual(peer.compact(receipt), {'id': 'x', 'delivery': 'accepted', 'operation': 'start', 'turn': 't'})
+        queued = dict(id='q', delivery='queued', transport='codex-queue', operation='queue', marker='m', after=1, result='warning: resume skipped', resume_error='writer busy')
+        self.assertEqual(peer.compact(queued), {'id': 'q', 'delivery': 'queued', 'transport': 'codex-queue', 'operation': 'queue', 'resume_error': 'writer busy', 'result': 'warning: resume skipped'})
+
+    def test_queue_mode_passes_resume(self):
+        class MissingIPC:
+            def __init__(self):
+                raise peer.PeerError('legacy VS Code IPC removed in test')
+        outcome = SimpleNamespace(returncode=0, stdout='queued', stderr='')
+        with patch.object(peer, 'IPC', MissingIPC), patch.object(peer, 'codex_binary', return_value='codex'), patch.object(peer.subprocess, 'run', return_value=outcome) as mock_run:
+            receipt = peer.send(self.info, 'message', mode='queue')
+        self.assertEqual(receipt['delivery'], 'queued')
+        self.assertEqual(receipt['transport'], 'codex-queue')
+        argv = mock_run.call_args[0][0]
+        self.assertIn('--resume', argv)
+        self.assertEqual(argv[:4], ['codex', 'queue', '--thread', 'fixture'])
+
+    def test_writer_conflict_falls_back_to_queue(self):
+        class MissingIPC:
+            def __init__(self):
+                raise peer.PeerError('legacy VS Code IPC removed in test')
+        outcome = SimpleNamespace(returncode=0, stdout='queued\n', stderr='warning: daemon unavailable')
+        conflict = peer.PeerError('failed to start codex exec: thread-store conflict: thread fixture already has an active writer')
+        with patch.object(peer, 'IPC', MissingIPC), patch.object(peer, 'codex_binary', return_value='codex'), patch.object(peer, 'pending', return_value=[]), patch.object(peer, 'start_exec', side_effect=conflict), patch.object(peer.subprocess, 'run', return_value=outcome) as mock_run:
+            receipt = peer.send(self.info, 'message', mode='auto')
+        self.assertEqual(receipt['delivery'], 'queued')
+        self.assertEqual(receipt['transport'], 'codex-queue')
+        self.assertIn('already has an active writer', receipt['resume_error'])
+        self.assertEqual(receipt['hint'], peer.OWNER_HINT)
+        self.assertIn('legacy VS Code IPC removed', receipt['live_unavailable'])
+        mock_run.assert_called_once()
+        self.assertIn('--resume', mock_run.call_args[0][0])
+
+    def test_explicit_exec_conflict_is_rejected_with_hint(self):
+        conflict = peer.PeerError('failed to start codex exec: thread-store conflict: thread fixture already has an active writer')
+        with patch.object(peer, 'codex_binary', return_value='codex'), patch.object(peer, 'pending', return_value=[]), patch.object(peer, 'start_exec', side_effect=conflict), patch.object(peer.subprocess, 'run') as mock_run:
+            receipt = peer.send(self.info, 'message', mode='exec')
+        self.assertEqual(receipt['delivery'], 'rejected')
+        self.assertIn('--mode queue', receipt['hint'])
+        mock_run.assert_not_called()
+
+    def test_missing_legacy_ipc_protocol_reports_unavailable(self):
+        ext_dir = self.root / 'ext' / 'openai.chatgpt-9.9' / 'out'
+        ext_dir.mkdir(parents=True)
+        (ext_dir / 'extension.js').write_text('"foo":1')
+        with patch.object(peer, 'EXTENSIONS', self.root / 'ext'):
+            with self.assertRaises(peer.PeerError) as ctx:
+                peer.IPC()
+        self.assertIn('legacy VS Code IPC removed', str(ctx.exception))
 
 
 if __name__ == '__main__':

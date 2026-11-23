@@ -40,11 +40,13 @@ codex-peer wait --thread code_bench --wait 1800
 | 字段 | 含义 / 下一步 |
 |---|---|
 | `delivery: accepted` | 已启动或实时送达（`operation` 为 `spawn` 新建、`resume` 后台续跑、`start`/`steer` 面板 IPC） |
-| `delivery: queued` | 目标线程正在运行且未在 VS Code 面板打开，消息已入 Codex 队列 |
+| `delivery: queued` | 目标线程正在运行，或写锁正被 VS Code 面板进程持有（active writer）；消息已通过 `codex queue --resume` 入队，将由持有方消化队列时执行 |
 | `delivery: unconfirmed` | 投递结果未知。先 `codex-peer read` 核对是否出现 `[Gemini:ID]`，**不要直接重发** |
 | `reply.state: observed` | 已拿到结果；`event.kind` 为 `task_complete` 表示完成，`turn_aborted` 表示中断 |
 | `reply.state: timeout` | 仍在运行；`progress` 为最近发言或工具操作，按 `next` 继续 `wait` |
 | `reply.state: idle` | Codex 已空闲且无排队消息，无需继续等待 |
+
+> 注：新版 VS Code Codex 扩展已移除旧版面板 IPC（`thread-owner-discovery` / `thread-follower-*`），`start`/`steer` 实时投递仅适用于旧版扩展；新版环境中，`ask`/`send` 会在遇到面板写锁冲突时自动改走 `codex queue --resume` 入队通道（也可显式传 `--mode queue`）。
 
 ## 命令一览
 
@@ -52,8 +54,8 @@ codex-peer wait --thread code_bench --wait 1800
 |---|---|
 | `spawn [--name 别名] '任务' [--wait 秒]` | 拉起全新 Codex 进程（`--cwd` 指定目录，`--model` 指定模型） |
 | `fleet [--clean]` | 查看所有命名 worker 的状态与最新回复；`--clean` 清空阵列注册表 |
-| `ask [--thread 别名/UUID] '消息' --wait 1800` | 向指定 worker 发送后续指令并等待本轮完成（自动选择面板 IPC 或后台 `resume`） |
-| `send [--thread 别名/UUID] '消息'` | 只发送不等待（fire-and-forget） |
+| `ask [--thread 别名/UUID] '消息' [--mode auto\|queue\|exec\|steer] --wait 1800` | 向指定 worker 发送后续指令并等待本轮完成（自动选择面板 IPC、后台 `resume` 或 `queue --resume`） |
+| `send [--thread 别名/UUID] '消息' [--mode auto\|queue\|exec\|steer]` | 只发送不等待（fire-and-forget）；`--mode queue` 直接走 `codex queue --resume` |
 | `wait [--thread 别名/UUID] [--after ID]` | 继续等待指定 worker 完成 |
 | `status [--thread 别名/UUID]` | 查看单个线程状态、最后发言、最后工具、排队消息（`--full` 附日志路径） |
 | `read [--thread 别名/UUID] --wait 20` | 增量读取新增对话与工具操作；`--reader 名称` 区分不同读取者游标 |
